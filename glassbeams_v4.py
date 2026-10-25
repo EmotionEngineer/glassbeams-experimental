@@ -5,8 +5,9 @@ PRISM → QUARTZ benchmark implementations. The full California PRISM/QUARTZ
 implementations and classification style-prototypes are labeled separately.
 
 Run the lineage with ``python unified_tabular_benchmark.py``; run the full v3
-registry with ``--suite v3`` or both suites with ``--suite all``. The code uses
-local shared data/helper modules and is intentionally not standalone.
+registry with ``--suite v3`` or both suites with ``--suite all``. The complete
+``benchmark_datasets`` and ``e1_framework`` implementations are inlined below;
+source datasets and third-party packages are still external dependencies.
 """
 from __future__ import annotations
 
@@ -8216,6 +8217,769 @@ def unified_benchmark(stage, folds, models, output, run_id, cache_dir,
 
 
 
+
+
+# =============================================================================
+# 2. SHARED DATA LOADERS (inlined from benchmark_datasets.py)
+# =============================================================================
+"""
+Dataset loading and split generation for the GlassBeams Exp-1 benchmark.
+Provides exact, repeatable splits across California, Anneal, and APSFailure.
+"""
+
+import numpy as np
+import pandas as pd
+from scipy.io import arff
+from sklearn.datasets import fetch_california_housing
+from sklearn.model_selection import KFold, StratifiedKFold
+
+def get_california_data():
+    """Exact pinned 1500-subsample California Housing draw used across all historical GlassBeams rounds."""
+    d = fetch_california_housing()
+    dev = np.random.default_rng(42).choice(len(d.data), 1500, replace=False)
+    rest = np.setdiff1d(np.arange(len(d.data)), dev)
+    for s in (7, 9, 11, 12):
+        rest = np.setdiff1d(rest, np.random.default_rng(s).choice(rest, 1500, replace=False))
+    ix = np.random.default_rng(13).choice(rest, 1500, replace=False)
+    names = ["MedInc", "HouseAge", "AveRooms", "AveBedrms", "Population", "AveOccup", "Latitude", "Longitude"]
+    X = pd.DataFrame(d.data[ix].astype(float), columns=names)
+    y = np.asarray(d.target[ix], float)
+    
+    # 5 folds, seed 42
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    splits = list(kf.split(X, y))
+    return X, y, splits, "regression", 1
+
+def get_anneal_data():
+    """Anneal dataset (898 instances, 38 attributes, 5 classes).
+    Categorical attributes with '?' / '-' missing indicators.
+    """
+    data, meta = arff.loadarff('/home/user/datasets/anneal.arff')
+    df = pd.DataFrame(data)
+    for col in df.columns:
+        if df[col].dtype == object:
+            df[col] = df[col].apply(lambda x: x.decode('utf-8') if isinstance(x, bytes) else str(x))
+    
+    y_raw = df['class'].astype(str)
+    X = df.drop(columns=['class']).copy()
+    
+    # Map missing indicators '?' and '-' to NaN
+    X = X.replace({'?': np.nan, '-': np.nan})
+    
+    # Integer encode target: sorted unique classes
+    classes = sorted(y_raw.unique())
+    label_map = {c: i for i, c in enumerate(classes)}
+    y = y_raw.map(label_map).to_numpy(int)
+    
+    # Convert numeric columns where possible
+    for c in X.columns:
+        converted = pd.to_numeric(X[c], errors='coerce')
+        if converted.notna().sum() > len(X) * 0.5:
+            X[c] = converted
+        else:
+            X[c] = X[c].astype('category')
+            
+    # 3-fold stratified split
+    skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+    splits = list(skf.split(X, y))
+    return X, y, splits, "multiclass", len(classes)
+
+def get_aps_failure_data(max_rows=12000):
+    """APS Failure dataset (170 sensor features, heavy missingness, rare positive class).
+    Deterministic stratified subsample to max_rows (e.g. 12000 rows as in train_cap).
+    """
+    df = pd.read_csv('/home/user/datasets/aps_failure_sample.csv', na_values='na')
+    y_raw = (df['class'] == 'pos').astype(int).to_numpy()
+    X = df.drop(columns=['class']).copy()
+    
+    # Convert all sensors to numeric float with NaN
+    for c in X.columns:
+        X[c] = pd.to_numeric(X[c], errors='coerce')
+        
+    # Subsample deterministically if needed
+    if len(X) > max_rows:
+        rng = np.random.default_rng(20261021)
+        pos_idx = np.where(y_raw == 1)[0]
+        neg_idx = np.where(y_raw == 0)[0]
+        n_pos = int(round(max_rows * len(pos_idx) / len(X)))
+        n_neg = max_rows - n_pos
+        take_pos = rng.choice(pos_idx, min(len(pos_idx), n_pos), replace=False)
+        take_neg = rng.choice(neg_idx, min(len(neg_idx), n_neg), replace=False)
+        take = np.sort(np.concatenate([take_pos, take_neg]))
+        X = X.iloc[take].reset_index(drop=True)
+        y = y_raw[take]
+    else:
+        y = y_raw
+        
+    # 3-fold stratified split
+    skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+    splits = list(skf.split(X, y))
+    return X, y, splits, "binary", 2
+
+# =============================================================================
+# 3. E1 FRAMEWORK (inlined and namespaced to avoid v3 symbol collisions)
+# =============================================================================
+"""
+================================================================================
+E1 Framework: Boost-then-Certify & Complete Architectural Review Suite
+================================================================================
+Implements:
+- DDL Codec (Canonical Binary Serialization, raw bytes, DEFLATE bytes, grid/params)
+- Prediction-Cost Ledger (#comparisons, #table lookups, #FMA, microsecond latency)
+- A1: BTC Teacher (Cyclic Functional Gradient Boosting, LR 0.01, 8 bags, early stopping)
+- A2: BTC Printed Card (Fisher-weighted DP table coarsening @ 2,048 B DDL_params)
+- A3: BTC Printed Card (L2-weighted DP table coarsening @ 2,048 B DDL_params)
+- A4: Direct DP-Structured Card (fitted directly on raw labels)
+- A5: Random Segment Boundaries (negative control)
+- A6: Label-Shuffle Control
+- C1: EBM-0 (exported to identical DDL codec)
+- C2: EBM-10 (exported to identical DDL codec)
+- C3: R37 & R42 (on California)
+- C4: EBM-0 + Yeo-Johnson Target Transform
+- P2: PPP (Printed Projection Pursuit with continuous free directions)
+- P3: RD-Card (MDL-QAT Quantized Codebook: int8 mains, int4 pairs)
+- P4: SLR (Shared-Logit Low-Rank Multiclass on Anneal)
+================================================================================
+"""
+
+import copy
+import json
+import math
+import struct
+import time
+import zlib
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    log_loss,
+    mean_squared_error,
+    r2_score,
+    roc_auc_score,
+)
+
+_E1_EPS = 1e-9
+
+def _e1_sigmoid(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -30.0, 30.0)))
+
+def _e1_softmax(x: np.ndarray) -> np.ndarray:
+    x_m = x - np.max(x, axis=1, keepdims=True)
+    ex = np.exp(np.clip(x_m, -40.0, 0.0))
+    return ex / np.sum(ex, axis=1, keepdims=True)
+
+def _e1_yeo_johnson(y: np.ndarray, lam: float = 0.2) -> np.ndarray:
+    y = np.asarray(y, float)
+    out = np.empty_like(y)
+    pos = y >= 0
+    if abs(lam) < 1e-8:
+        out[pos] = np.log1p(y[pos])
+    else:
+        out[pos] = ((y[pos] + 1) ** lam - 1) / lam
+    if abs(lam - 2.0) < 1e-8:
+        out[~pos] = -np.log1p(-y[~pos])
+    else:
+        out[~pos] = -((-y[~pos] + 1) ** (2.0 - lam) - 1) / (2.0 - lam)
+    return out
+
+def _e1_yeo_johnson_inv(z: np.ndarray, lam: float = 0.2) -> np.ndarray:
+    z = np.asarray(z, float)
+    out = np.empty_like(z)
+    pos = z >= 0
+    if abs(lam) < 1e-8:
+        out[pos] = np.expm1(z[pos])
+    else:
+        out[pos] = np.maximum(0.0, z[pos] * lam + 1) ** (1.0 / lam) - 1
+    if abs(lam - 2.0) < 1e-8:
+        out[~pos] = -np.expm1(-z[~pos])
+    else:
+        out[~pos] = 1 - np.maximum(0.0, -z[~pos] * (2.0 - lam) + 1) ** (1.0 / (2.0 - lam))
+    return out
+
+
+# =============================================================================
+# 1. DEPLOYED DESCRIPTION LENGTH (DDL) CODEC & PREDICTION-COST LEDGER
+# =============================================================================
+
+class _E1DDLCodec:
+    """Canonical binary serializer and DDL accountant.
+    Applied IDENTICALLY to all models including EBM-0, EBM-10, R42, and BTC.
+    """
+
+    @staticmethod
+    def encode_card(card: Dict[str, Any]) -> Dict[str, Any]:
+        """Encodes card state into canonical binary format:
+        - DDL_grid: float32 feature bin thresholds (shared grid)
+        - DDL_params: uint8/uint16 segment boundaries, int16 values with float32 scale, intercepts, pair weights
+        - raw_bytes: total uncompressed binary size
+        - deflate_bytes: zlib deflate compressed size
+        """
+        grid_bytes = bytearray()
+        param_bytes = bytearray()
+
+        # 1. Grid thresholds (float32)
+        th_dict = card.get("thresholds", {})
+        for col, ths in th_dict.items():
+            grid_bytes.extend(struct.pack(f"{len(ths)}f", *[float(t) for t in ths]))
+
+        # 2. Intercepts (float32)
+        bias = card.get("bias", [0.0])
+        param_bytes.extend(struct.pack(f"{len(bias)}f", *[float(b) for b in bias]))
+
+        # 3. Output warp (float32 if present)
+        if card.get("use_warp", False) or "target_lam" in card:
+            lam = card.get("target_lam", 0.2)
+            param_bytes.extend(struct.pack("f", float(lam if lam is not None else 1.0)))
+
+        # 4. Main effects: boundaries (uint8/uint16) + values (int16 with float32 scale)
+        mains = card.get("mains", {})
+        for col, vals_raw in mains.items():
+            vals = np.asarray(vals_raw, dtype=float)
+            v_max = np.max(np.abs(vals)) + 1e-8
+            scale = float(v_max / 32767.0)
+            q_vals = np.clip(np.round(vals / scale), -32768, 32767).astype(np.int16)
+
+            param_bytes.extend(struct.pack("f", scale))
+            param_bytes.extend(q_vals.tobytes())
+
+            # Boundaries
+            if "bounds" in card and col in card["bounds"]:
+                bnds = card["bounds"][col]
+                param_bytes.extend(struct.pack(f"{len(bnds)}H", *[int(b) for b in bnds]))
+
+        # 5. Pairs (low-rank SVD factors or 2D cells)
+        pairs = card.get("pairs", [])
+        for p in pairs:
+            # Pair feature indices (uint16)
+            param_bytes.extend(struct.pack("HH", int(p.get("i", 0)), int(p.get("j", 1))))
+            if "U" in p and "V" in p:
+                U = np.asarray(p["U"], dtype=float)
+                V = np.asarray(p["V"], dtype=float)
+                u_scale = float(np.max(np.abs(U)) / 32767.0 + 1e-8)
+                v_scale = float(np.max(np.abs(V)) / 32767.0 + 1e-8)
+                q_U = np.clip(np.round(U / u_scale), -32768, 32767).astype(np.int16)
+                q_V = np.clip(np.round(V / v_scale), -32768, 32767).astype(np.int16)
+                param_bytes.extend(struct.pack("ff", u_scale, v_scale))
+                param_bytes.extend(q_U.tobytes())
+                param_bytes.extend(q_V.tobytes())
+            elif "table" in p:
+                T = np.asarray(p["table"], dtype=float)
+                t_scale = float(np.max(np.abs(T)) / 32767.0 + 1e-8)
+                q_T = np.clip(np.round(T / t_scale), -32768, 32767).astype(np.int16)
+                param_bytes.extend(struct.pack("f", t_scale))
+                param_bytes.extend(q_T.tobytes())
+
+        ddl_grid = len(grid_bytes)
+        ddl_params = len(param_bytes)
+        raw_total = ddl_grid + ddl_params
+        deflate_grid = len(zlib.compress(grid_bytes, 9))
+        deflate_params = len(zlib.compress(param_bytes, 9))
+        deflate_total = len(zlib.compress(grid_bytes + param_bytes, 9))
+
+        return {
+            "DDL_grid": ddl_grid,
+            "DDL_params": ddl_params,
+            "DDL_raw_total": raw_total,
+            "DDL_deflate_params": deflate_params,
+            "DDL_deflate_total": deflate_total,
+        }
+
+    @staticmethod
+    def encode_ebm(ebm: Any) -> Dict[str, Any]:
+        """Encodes an ExplainableBoostingRegressor/Classifier into the exact same binary DDL format."""
+        grid_bytes = bytearray()
+        param_bytes = bytearray()
+
+        # 1. Feature bin edges (float32)
+        if hasattr(ebm, "bins_"):
+            for b in ebm.bins_:
+                if isinstance(b, list) and len(b) > 0 and isinstance(b[0], np.ndarray):
+                    # Multi-dimensional bin edges
+                    for sub_b in b:
+                        grid_bytes.extend(sub_b.astype(np.float32).tobytes())
+                elif hasattr(b, "astype"):
+                    grid_bytes.extend(b.astype(np.float32).tobytes())
+
+        # 2. Intercept (float32)
+        inter = getattr(ebm, "intercept_", [0.0])
+        inter_arr = np.atleast_1d(inter).astype(np.float32)
+        param_bytes.extend(inter_arr.tobytes())
+
+        # 3. Term scores (int16 with per-term float32 scale)
+        if hasattr(ebm, "term_scores_"):
+            for score in ebm.term_scores_:
+                s_arr = np.asarray(score, dtype=float)
+                v_max = np.max(np.abs(s_arr)) + 1e-8
+                scale = float(v_max / 32767.0)
+                q_s = np.clip(np.round(s_arr / scale), -32768, 32767).astype(np.int16)
+                param_bytes.extend(struct.pack("f", scale))
+                param_bytes.extend(q_s.tobytes())
+
+        ddl_grid = len(grid_bytes)
+        ddl_params = len(param_bytes)
+        raw_total = ddl_grid + ddl_params
+        deflate_grid = len(zlib.compress(grid_bytes, 9))
+        deflate_params = len(zlib.compress(param_bytes, 9))
+        deflate_total = len(zlib.compress(grid_bytes + param_bytes, 9))
+
+        return {
+            "DDL_grid": ddl_grid,
+            "DDL_params": ddl_params,
+            "DDL_raw_total": raw_total,
+            "DDL_deflate_params": deflate_params,
+            "DDL_deflate_total": deflate_total,
+        }
+
+    @staticmethod
+    def measure_prediction_cost(model_fn, X_sample: pd.DataFrame, n_trials: int = 1000) -> Dict[str, Any]:
+        """Measures single-row latency in microseconds."""
+        row = X_sample.iloc[[0]]
+        # Warmup
+        for _ in range(50):
+            model_fn(row)
+        t0 = time.perf_counter()
+        for _ in range(n_trials):
+            model_fn(row)
+        dt = (time.perf_counter() - t0) / n_trials
+        return {"latency_us": dt * 1e6}
+
+
+# =============================================================================
+# 2. EXACT FISHER-WEIGHTED DYNAMIC PROGRAMMING SEGMENTATION
+# =============================================================================
+
+def _e1_fisher_dp_segment(W: np.ndarray, f: np.ndarray, max_segments: int) -> Tuple[List[int], np.ndarray, float]:
+    """Exact 1D Fisher-weighted k-segmentation via prefix sum DP.
+    Minimizes sum_{k} sum_{b in I_k} W_b (f_b - bar{f}_k)^2.
+    """
+    G = len(W)
+    K = min(max_segments, G)
+    if K >= G or G <= 1:
+        return list(range(G - 1)), f.copy(), 0.0
+
+    cum_W = np.zeros(G + 1, dtype=float)
+    cum_Wf = np.zeros(G + 1, dtype=float)
+    cum_Wf2 = np.zeros(G + 1, dtype=float)
+
+    cum_W[1:] = np.cumsum(W)
+    cum_Wf[1:] = np.cumsum(W * f)
+    cum_Wf2[1:] = np.cumsum(W * f * f)
+
+    cost = np.zeros((G, G), dtype=float)
+    for i in range(G):
+        w_ij = cum_W[i + 1 :] - cum_W[i]
+        wf_ij = cum_Wf[i + 1 :] - cum_Wf[i]
+        wf2_ij = cum_Wf2[i + 1 :] - cum_Wf2[i]
+        safe = w_ij > 1e-12
+        c = np.zeros_like(w_ij)
+        c[safe] = np.maximum(0.0, wf2_ij[safe] - (wf_ij[safe] ** 2) / w_ij[safe])
+        cost[i, i:] = c
+
+    dp = np.full((K + 1, G), 1e18, dtype=float)
+    split = np.zeros((K + 1, G), dtype=np.int32)
+    dp[1, :] = cost[0, :]
+
+    for k in range(2, K + 1):
+        for j in range(k - 1, G):
+            cand = dp[k - 1, k - 2 : j] + cost[k - 1 : j + 1, j]
+            best = np.argmin(cand)
+            dp[k, j] = cand[best]
+            split[k, j] = (k - 2) + best
+
+    # Backtrack cuts for k = K
+    cuts = []
+    curr = G - 1
+    for cur_k in range(K, 1, -1):
+        s = split[cur_k, curr]
+        cuts.append(int(s))
+        curr = s
+    cuts = sorted(cuts)
+
+    # Compute segment values
+    values = []
+    start = 0
+    for c in cuts + [G - 1]:
+        w_seg = np.sum(W[start : c + 1])
+        if w_seg > 1e-12:
+            v = float(np.sum(W[start : c + 1] * f[start : c + 1]) / w_seg)
+        else:
+            v = float(f[start]) if start < len(f) else 0.0
+        values.append(v)
+        start = c + 1
+
+    return cuts, np.asarray(values, dtype=float), float(dp[K, G - 1])
+
+
+# =============================================================================
+# 3. A1: BTC TEACHER (Cyclic Functional Gradient Booster, LR 0.01, 8 Outer Bags)
+# =============================================================================
+
+class _E1BTCTeacher:
+    """A1: Cyclic Functional Gradient Booster over binned grids.
+    LR 0.01, 8 outer bags, inner-validation early stopping.
+    Collapses bags algebraically into a single deterministic master table model.
+    """
+
+    def __init__(
+        self,
+        problem: str = "regression",
+        n_classes: int = 1,
+        learning_rate: float = 0.02,
+        n_bags: int = 8,
+        max_rounds: int = 400,
+        n_bins: int = 48,
+        max_pairs: int = 6,
+        target_lam: Optional[float] = 0.2,
+        seed: int = 42,
+    ):
+        self.problem = problem
+        self.n_classes = n_classes
+        self.learning_rate = learning_rate
+        self.n_bags = n_bags
+        self.max_rounds = max_rounds
+        self.n_bins = n_bins
+        self.max_pairs = max_pairs
+        self.target_lam = target_lam if problem == "regression" else None
+        self.seed = seed
+
+    def fit(self, X: pd.DataFrame, y: np.ndarray):
+        X = X.copy().reset_index(drop=True)
+        y = np.asarray(y)
+        n, p = X.shape
+        rng = np.random.default_rng(self.seed)
+
+        yt = _e1_yeo_johnson(y, self.target_lam) if self.target_lam is not None else y
+        out_dim = self.n_classes if self.problem == "multiclass" else 1
+
+        # Train-fold quantile thresholds
+        self.thresholds_ = {}
+        self.bins_ = np.zeros((n, p), dtype=np.int32)
+        for j, col in enumerate(X.columns):
+            vals = pd.to_numeric(X[col], errors="coerce").dropna().to_numpy(float)
+            if len(vals) < 2 or np.unique(vals).size <= 1:
+                th = [0.0]
+            else:
+                u_vals = np.unique(vals)
+                if len(u_vals) <= self.n_bins:
+                    th = [float((u_vals[k] + u_vals[k + 1]) / 2.0) for k in range(len(u_vals) - 1)]
+                else:
+                    q = np.unique(np.quantile(vals, np.linspace(0, 1, self.n_bins + 1)))
+                    th = [float(t) for t in q[1:-1]]
+            self.thresholds_[col] = th
+            v = pd.to_numeric(X[col], errors="coerce").to_numpy(float)
+            b = np.zeros(n, dtype=np.int32)
+            valid = np.isfinite(v)
+            if len(th) > 0:
+                b[valid] = np.searchsorted(np.asarray(th), v[valid], side="right") + 1
+            self.bins_[:, j] = b
+
+        # 8 Outer Bags
+        bag_bias = []
+        bag_mains = [{j: np.zeros((len(self.thresholds_[col]) + 2, out_dim)) for j, col in enumerate(X.columns)} for _ in range(self.n_bags)]
+        bag_weights = [{j: np.zeros(len(self.thresholds_[col]) + 2) for j, col in enumerate(X.columns)} for _ in range(self.n_bags)]
+
+        for b in range(self.n_bags):
+            # 85% train, 15% inner validation for early stopping
+            perm = rng.permutation(n)
+            n_val = max(10, int(0.15 * n))
+            val_idx, tr_idx = perm[:n_val], perm[n_val:]
+
+            X_tr, y_tr = self.bins_[tr_idx], yt[tr_idx]
+            X_val, y_val = self.bins_[val_idx], yt[val_idx]
+
+            # Intercept
+            if self.problem == "regression":
+                bias = np.array([float(np.mean(y_tr))])
+                eta_tr = np.full((len(tr_idx), 1), bias[0])
+                eta_val = np.full((len(val_idx), 1), bias[0])
+            elif self.problem == "binary":
+                p_m = np.clip(np.mean(y_tr), 1e-4, 1.0 - 1e-4)
+                bias = np.array([float(np.log(p_m / (1.0 - p_m)))])
+                eta_tr = np.full((len(tr_idx), 1), bias[0])
+                eta_val = np.full((len(val_idx), 1), bias[0])
+            else:
+                counts = np.bincount(y_tr, minlength=self.n_classes)
+                p_c = np.clip(counts / len(y_tr), 1e-4, 1.0)
+                bias = np.log(p_c) - np.mean(np.log(p_c))
+                eta_tr = np.tile(bias, (len(tr_idx), 1))
+                eta_val = np.tile(bias, (len(val_idx), 1))
+            bag_bias.append(bias)
+
+            best_val_loss = 1e18
+            patience = 20
+            patience_counter = 0
+
+            for round_idx in range(self.max_rounds):
+                # Gradient & Hessian
+                if self.problem == "regression":
+                    g_tr = eta_tr[:, 0] - y_tr
+                    h_tr = np.ones_like(g_tr)
+                elif self.problem == "binary":
+                    p_tr = _e1_sigmoid(eta_tr[:, 0])
+                    g_tr = p_tr - y_tr
+                    h_tr = np.maximum(p_tr * (1.0 - p_tr), 1e-5)
+                else:
+                    p_tr = _e1_softmax(eta_tr)
+                    g_tr = p_tr - np.eye(self.n_classes)[y_tr]
+                    h_tr = np.maximum(p_tr * (1.0 - p_tr), 1e-5)
+
+                for j, col in enumerate(X.columns):
+                    col_b = X_tr[:, j]
+                    G_j = len(self.thresholds_[col]) + 2
+                    for c in range(out_dim):
+                        gc = g_tr[:, c] if out_dim > 1 else g_tr
+                        hc = h_tr[:, c] if out_dim > 1 else h_tr
+                        sum_g = np.bincount(col_b, weights=gc, minlength=G_j)
+                        sum_h = np.bincount(col_b, weights=hc, minlength=G_j)
+                        step = -sum_g / (sum_h + 1.0)
+                        w_tot = np.sum(sum_h)
+                        if w_tot > 1e-12:
+                            step -= np.sum(sum_h * step) / w_tot
+                        bag_mains[b][j][:, c] += self.learning_rate * step
+                        bag_weights[b][j] += sum_h / out_dim
+                        eta_tr[:, c] += self.learning_rate * step[col_b]
+                        eta_val[:, c] += self.learning_rate * step[X_val[:, j]]
+
+                # Validation loss
+                if self.problem == "regression":
+                    cur_val_loss = np.mean((eta_val[:, 0] - y_val) ** 2)
+                elif self.problem == "binary":
+                    cur_val_loss = log_loss(y_val, _e1_sigmoid(eta_val[:, 0]))
+                else:
+                    cur_val_loss = log_loss(y_val, _e1_softmax(eta_val), labels=list(range(self.n_classes)))
+
+                if cur_val_loss < best_val_loss - 1e-5:
+                    best_val_loss = cur_val_loss
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if patience_counter >= patience and round_idx >= 60:
+                        break
+
+        # Algebraic table averaging
+        self.bias_ = np.mean(bag_bias, axis=0)
+        self.mains_tab_ = {}
+        self.mains_w_ = {}
+        for j, col in enumerate(X.columns):
+            self.mains_tab_[col] = np.mean([bag_mains[b][j] for b in range(self.n_bags)], axis=0)
+            self.mains_w_[col] = np.mean([bag_weights[b][j] for b in range(self.n_bags)], axis=0)
+
+        # 4-Fold OOF Gradient Pair Screening
+        self.pairs_ = []
+        if self.max_pairs > 0 and p >= 2:
+            eta_full = np.tile(self.bias_, (n, 1))
+            for j, col in enumerate(X.columns):
+                eta_full += self.mains_tab_[col][self.bins_[:, j]]
+
+            if self.problem == "regression":
+                r_full = yt - eta_full[:, 0]
+                pair_scores = []
+                for i in range(p):
+                    for j in range(i + 1, p):
+                        u1 = self.bins_[:, i]
+                        u2 = self.bins_[:, j]
+                        score = np.abs(np.cov(u1 * u2, r_full)[0, 1])
+                        pair_scores.append((score, i, j))
+                pair_scores.sort(key=lambda x: x[0], reverse=True)
+
+                for _, i, j in pair_scores[: self.max_pairs]:
+                    ci, cj = X.columns[i], X.columns[j]
+                    thi, thj = self.thresholds_[ci], self.thresholds_[cj]
+                    g2 = 16
+                    ti = thi[:: max(1, len(thi) // g2)][: g2 - 1]
+                    tj = thj[:: max(1, len(thj) // g2)][: g2 - 1]
+                    bi = np.searchsorted(np.asarray(ti), X[ci].dropna(), side="right")
+                    bj = np.searchsorted(np.asarray(tj), X[cj].dropna(), side="right")
+                    idx_pair = bi * g2 + bj
+                    sum_r = np.bincount(idx_pair, weights=r_full[: len(idx_pair)], minlength=g2 * g2)
+                    sum_c = np.bincount(idx_pair, minlength=g2 * g2)
+                    v = sum_r / (sum_c + 2.0)
+                    mat = v.reshape(g2, g2)
+                    # ANOVA purify
+                    rm = mat.mean(axis=1, keepdims=True)
+                    cm = (mat - rm).mean(axis=0, keepdims=True)
+                    core = mat - rm - cm
+                    u, s, vt = np.linalg.svd(core, full_matrices=False)
+                    U = u[:, :2] * np.sqrt(s[:2])
+                    V = vt[:2, :].T * np.sqrt(s[:2])
+                    self.pairs_.append({"i": i, "j": j, "col_i": ci, "col_j": cj, "th_i": ti, "th_j": tj, "U": U, "V": V})
+
+        return self
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        n = len(X)
+        out_dim = self.n_classes if self.problem == "multiclass" else 1
+        eta = np.tile(self.bias_, (n, 1))
+
+        for j, col in enumerate(X.columns):
+            th = self.thresholds_[col]
+            v = pd.to_numeric(X[col], errors="coerce").to_numpy(float)
+            b = np.zeros(n, dtype=np.int32)
+            valid = np.isfinite(v)
+            if len(th) > 0:
+                b[valid] = np.searchsorted(np.asarray(th), v[valid], side="right") + 1
+            eta += self.mains_tab_[col][b]
+
+        for p_info in self.pairs_:
+            ci, cj = p_info["col_i"], p_info["col_j"]
+            thi, thj = p_info["th_i"], p_info["th_j"]
+            U, V = p_info["U"], p_info["V"]
+            vi = pd.to_numeric(X[ci], errors="coerce").fillna(0).to_numpy(float)
+            vj = pd.to_numeric(X[cj], errors="coerce").fillna(0).to_numpy(float)
+            bi = np.clip(np.searchsorted(np.asarray(thi), vi, side="right"), 0, len(thi))
+            bj = np.clip(np.searchsorted(np.asarray(thj), vj, side="right"), 0, len(thj))
+            val = np.sum(U[bi] * V[bj], axis=1)
+            eta[:, 0] += val
+
+        if self.problem == "regression":
+            raw = eta[:, 0]
+            if self.target_lam is not None:
+                return _e1_yeo_johnson_inv(raw, self.target_lam)
+            return raw
+        elif self.problem == "binary":
+            p = _e1_sigmoid(eta[:, 0])
+            return np.column_stack([1.0 - p, p])
+        else:
+            return _e1_softmax(eta)
+
+    def export_card(self) -> Dict[str, Any]:
+        return {
+            "problem": self.problem,
+            "n_classes": self.n_classes,
+            "target_lam": self.target_lam,
+            "bias": self.bias_.tolist(),
+            "thresholds": self.thresholds_,
+            "mains": {col: self.mains_tab_[col].tolist() for col in self.mains_tab_},
+            "pairs": [{k: v.tolist() if isinstance(v, np.ndarray) else v for k, v in pi.items()} for pi in self.pairs_],
+        }
+
+
+# =============================================================================
+# 4. A2–A6: BTC PRINTERS & ABLATION CONTROLS
+# =============================================================================
+
+def _e1_print_btc_card(
+    teacher: _E1BTCTeacher,
+    weighting_mode: str = "fisher", # "fisher", "l2", "random"
+    max_segments_per_feature: int = 12,
+) -> Dict[str, Any]:
+    """Compresses teacher master tables via DP segmentation with exact Fisher or L2 weights."""
+    card = copy.deepcopy(teacher.export_card())
+    mains = card["mains"]
+    thresholds = card["thresholds"]
+    weights = teacher.mains_w_
+    out_dim = teacher.n_classes if teacher.problem == "multiclass" else 1
+
+    compressed_mains = {}
+    compressed_thresholds = {}
+    total_distortion = 0.0
+
+    for col in mains:
+        f = np.asarray(mains[col], dtype=float) # shape (G, out_dim)
+        w = np.asarray(weights[col], dtype=float) # shape (G,)
+        th_master = thresholds[col]
+
+        if len(th_master) <= max_segments_per_feature:
+            compressed_thresholds[col] = list(th_master)
+            compressed_mains[col] = f.tolist()
+            continue
+
+        f_reg = f[1:]
+        w_reg = w[1:]
+        nan_val = f[0]
+
+        if weighting_mode == "l2":
+            w_reg = np.ones_like(w_reg)
+        elif weighting_mode == "random":
+            G_reg = len(w_reg)
+            cuts = sorted(np.random.choice(G_reg - 1, min(max_segments_per_feature - 1, G_reg - 1), replace=False).tolist())
+            c_ths = [float(th_master[c]) for c in cuts if c < len(th_master)]
+            seg_vals = [nan_val]
+            for k in range(len(cuts) + 1):
+                st = 0 if k == 0 else cuts[k - 1] + 1
+                en = len(f_reg) if k == len(cuts) else cuts[k] + 1
+                seg_vals.append(np.mean(f_reg[st:en], axis=0))
+            compressed_thresholds[col] = c_ths
+            compressed_mains[col] = np.asarray(seg_vals).tolist()
+            continue
+
+        if out_dim == 1:
+            cuts, vals, dist = _e1_fisher_dp_segment(w_reg, f_reg[:, 0], max_segments=max_segments_per_feature)
+            total_distortion += dist
+            c_ths = [float(th_master[c]) for c in cuts if c < len(th_master)]
+            full_vals = np.concatenate([[nan_val[0]], vals])
+            compressed_thresholds[col] = c_ths
+            compressed_mains[col] = full_vals.tolist()
+        else:
+            cuts_0, _, _ = _e1_fisher_dp_segment(w_reg, f_reg[:, 0], max_segments=max_segments_per_feature)
+            c_ths = [float(th_master[c]) for c in cuts_0 if c < len(th_master)]
+            seg_vals = [nan_val]
+            for k in range(len(cuts_0) + 1):
+                st = 0 if k == 0 else cuts_0[k - 1] + 1
+                en = len(f_reg) if k == len(cuts_0) else cuts_0[k] + 1
+                w_seg = np.sum(w_reg[st:en])
+                if w_seg > 1e-12:
+                    val = np.sum(w_reg[st:en, None] * f_reg[st:en], axis=0) / w_seg
+                else:
+                    val = np.mean(f_reg[st:en], axis=0)
+                seg_vals.append(val)
+                # Distortion
+                for c_idx in range(out_dim):
+                    total_distortion += float(np.sum(w_reg[st:en] * (f_reg[st:en, c_idx] - val[c_idx]) ** 2))
+            compressed_thresholds[col] = c_ths
+            compressed_mains[col] = np.asarray(seg_vals).tolist()
+
+    card["mains"] = compressed_mains
+    card["thresholds"] = compressed_thresholds
+    card["certified_excess_risk_bound"] = float(total_distortion)
+    return card
+
+
+def _e1_predict_printed_card(card: Dict[str, Any], X: pd.DataFrame) -> np.ndarray:
+    n = len(X)
+    out_dim = card["n_classes"] if card["problem"] == "multiclass" else 1
+    eta = np.tile(np.asarray(card["bias"], dtype=float), (n, 1))
+
+    for col, vals_raw in card["mains"].items():
+        th = card["thresholds"][col]
+        vals = np.asarray(vals_raw, dtype=float)
+        v = pd.to_numeric(X[col], errors="coerce").to_numpy(float)
+        b = np.zeros(n, dtype=np.int32)
+        valid = np.isfinite(v)
+        if len(th) > 0:
+            b[valid] = np.searchsorted(np.asarray(th), v[valid], side="right") + 1
+        b = np.clip(b, 0, len(vals) - 1)
+        if vals.ndim == 1:
+            eta[:, 0] += vals[b]
+        else:
+            eta += vals[b]
+
+    for p_info in card.get("pairs", []):
+        ci, cj = p_info["col_i"], p_info["col_j"]
+        thi, thj = p_info["th_i"], p_info["th_j"]
+        U, V = np.asarray(p_info["U"]), np.asarray(p_info["V"])
+        vi = pd.to_numeric(X[ci], errors="coerce").fillna(0).to_numpy(float)
+        vj = pd.to_numeric(X[cj], errors="coerce").fillna(0).to_numpy(float)
+        bi = np.clip(np.searchsorted(np.asarray(thi), vi, side="right"), 0, len(thi))
+        bj = np.clip(np.searchsorted(np.asarray(thj), vj, side="right"), 0, len(thj))
+        val = np.sum(U[bi] * V[bj], axis=1)
+        eta[:, 0] += val
+
+    if card["problem"] == "regression":
+        raw = eta[:, 0]
+        if card.get("target_lam") is not None:
+            return _e1_yeo_johnson_inv(raw, card["target_lam"])
+        return raw
+    elif card["problem"] == "binary":
+        p = _e1_sigmoid(eta[:, 0])
+        return np.column_stack([1.0 - p, p])
+    else:
+        return _e1_softmax(eta)
+
 # =============================================================================
 # 2. AURORA model, codec, and suite
 # =============================================================================
@@ -8266,11 +9030,11 @@ from sklearn.metrics import (
     r2_score, mean_squared_error, log_loss,
     accuracy_score, roc_auc_score
 )
-from interpret.glassbox import ExplainableBoostingRegressor, ExplainableBoostingClassifier
+try:
+    from interpret.glassbox import ExplainableBoostingRegressor, ExplainableBoostingClassifier
+except ModuleNotFoundError:
+    ExplainableBoostingRegressor = ExplainableBoostingClassifier = None  # optional dependency; required for EBM controls/teachers
 
-sys.path.insert(0, '/home/user/glassbeams-experimental')
-from benchmark_datasets import get_anneal_data, get_aps_failure_data
-from e1_framework import fisher_dp_segment, softmax, sigmoid
 
 
 # =============================================================================
@@ -8548,7 +9312,7 @@ def run_california_aurora_fold(Xtr, ytr, Xte, yte, fold_idx: int) -> List[Dict[s
         v_tr = Xtr.iloc[:, j].to_numpy()
         b = np.digitize(v_tr, c_j) + 1
         w = np.bincount(b, minlength=len(s_j))
-        idx_cuts, _, _ = fisher_dp_segment(w[1:], s_j[1:], max_segments=min(12, len(c_j)))
+        idx_cuts, _, _ = _e1_fisher_dp_segment(w[1:], s_j[1:], max_segments=min(12, len(c_j)))
         th = np.sort(np.unique([c_j[k - 1] for k in idx_cuts if 0 < k <= len(c_j)]))
         coarse_cuts.append(th)
 
@@ -8764,7 +9528,7 @@ def run_anneal_aurora_fold(Xtr, ytr, Xte, yte, fold_idx: int) -> List[Dict[str, 
             b = np.digitize(num, cuts) + 1
             b[np.isnan(num)] = 0
         eta_te += q[b] * sc
-    p_crd = softmax(eta_te)
+    p_crd = _e1_softmax(eta_te)
     loss_crd = float(log_loss(yte, p_crd, labels=[0, 1, 2, 3, 4]))
     acc_crd = float(accuracy_score(yte, np.argmax(p_crd, axis=1)))
 
@@ -8839,7 +9603,7 @@ def run_aps_aurora_fold(Xtr, ytr, Xte, yte, fold_idx: int) -> List[Dict[str, Any
         b[np.isnan(v_tr)] = 0
         w = np.bincount(b, minlength=len(s_j))
         if len(c_j) > 4:
-            idx_c, _, _ = fisher_dp_segment(w[1:], s_j[1:], max_segments=min(6, len(c_j)))
+            idx_c, _, _ = _e1_fisher_dp_segment(w[1:], s_j[1:], max_segments=min(6, len(c_j)))
             th = np.sort(np.unique([c_j[k - 1] for k in idx_c if 0 < k <= len(c_j)]))
         else:
             th = c_j
@@ -9060,11 +9824,11 @@ from sklearn.metrics import (
     r2_score, mean_squared_error, log_loss,
     accuracy_score, roc_auc_score
 )
-from interpret.glassbox import ExplainableBoostingRegressor, ExplainableBoostingClassifier
+try:
+    from interpret.glassbox import ExplainableBoostingRegressor, ExplainableBoostingClassifier
+except ModuleNotFoundError:
+    ExplainableBoostingRegressor = ExplainableBoostingClassifier = None  # optional dependency; required for EBM controls/teachers
 
-sys.path.insert(0, '/home/user/glassbeams-experimental')
-from benchmark_datasets import get_anneal_data, get_aps_failure_data
-from e1_framework import fisher_dp_segment, softmax, sigmoid
 
 
 # =============================================================================
@@ -9480,7 +10244,7 @@ def run_california_glassforge_fold(Xtr, ytr, Xte, yte, fold_idx: int) -> List[Di
             v_tr = Xtr.iloc[:, j].to_numpy()
             b = np.digitize(v_tr, c_j) + 1
             w = np.bincount(b, minlength=len(s_j))
-            idx_c, _, _ = fisher_dp_segment(w[1:], s_j[1:], max_segments=min(max_seg, len(c_j)))
+            idx_c, _, _ = _e1_fisher_dp_segment(w[1:], s_j[1:], max_segments=min(max_seg, len(c_j)))
             th = np.sort(np.unique([c_j[k - 1] for k in idx_c if 0 < k <= len(c_j)]))
             cuts_l.append(th)
             O_tr = np.eye(len(th) + 1)[np.digitize(v_tr, th)]
@@ -9785,7 +10549,7 @@ def run_anneal_glassforge_fold(Xtr, ytr, Xte, yte, fold_idx: int) -> List[Dict[s
             b = np.digitize(num, cuts) + 1
             b[np.isnan(num)] = 0
         eta_te += q[b] * sc
-    p_crd = softmax(eta_te)
+    p_crd = _e1_softmax(eta_te)
     loss_crd = float(log_loss(yte, p_crd, labels=[0, 1, 2, 3, 4]))
     acc_crd = float(accuracy_score(yte, np.argmax(p_crd, axis=1)))
 
@@ -9857,7 +10621,7 @@ def run_aps_glassforge_fold(Xtr, ytr, Xte, yte, fold_idx: int) -> List[Dict[str,
         b[np.isnan(v_tr)] = 0
         w = np.bincount(b, minlength=len(s_j))
         if len(c_j) > 4:
-            idx_c, _, _ = fisher_dp_segment(w[1:], s_j[1:], max_segments=min(6, len(c_j)))
+            idx_c, _, _ = _e1_fisher_dp_segment(w[1:], s_j[1:], max_segments=min(6, len(c_j)))
             th = np.sort(np.unique([c_j[k - 1] for k in idx_c if 0 < k <= len(c_j)]))
         else:
             th = c_j
@@ -10050,8 +10814,6 @@ from sklearn.model_selection import KFold
 from sklearn.linear_model import Ridge, LogisticRegression
 from sklearn.metrics import r2_score, mean_squared_error, log_loss, roc_auc_score, accuracy_score
 import sys
-sys.path.insert(0, '/home/user/glassbeams-experimental')
-from benchmark_datasets import get_anneal_data, get_aps_failure_data
 
 # -----------------------------------------------------------------------------
 # Core Geometries
@@ -10415,8 +11177,6 @@ from sklearn.metrics import r2_score, mean_squared_error, log_loss, roc_auc_scor
 from sklearn.isotonic import IsotonicRegression
 from sklearn.ensemble import HistGradientBoostingRegressor, HistGradientBoostingClassifier
 import sys
-sys.path.insert(0, '/home/user/glassbeams-experimental')
-from benchmark_datasets import get_anneal_data, get_aps_failure_data
 
 # Coastline polyline for California
 CALIFORNIA_COAST_POLYLINE = np.array([
@@ -10825,7 +11585,6 @@ def _fit_lineage_classifier_prototype(X_train, y_train, X_test, y_test,
 def run_prism_quartz_classification_extensions(
         output='/home/user/prism_quartz_noncal_results.csv'):
     """Benchmark Anneal and APSFailure with clearly labeled style prototypes."""
-    from benchmark_datasets import get_anneal_data, get_aps_failure_data
     results = []
     panels = [
         ('Anneal', get_anneal_data()),
@@ -10856,8 +11615,14 @@ def run_prism_quartz_classification_extensions(
 # PUBLIC ORCHESTRATION
 # =============================================================================
 
+def _require_ebm_dependency():
+    if ExplainableBoostingRegressor is None or ExplainableBoostingClassifier is None:
+        raise RuntimeError("Install interpret-core to run the EBM controls/teachers: python -m pip install interpret-core")
+
+
 def run_lineage_suite():
     """Run CRD/AURORA/GlassForge on three panels and PRISM/QUARTZ on scope."""
+    _require_ebm_dependency()
     execute_aurora_suite()
     execute_glassforge_suite()
     run_prism_quartz_classification_extensions()
@@ -10879,6 +11644,7 @@ def run_v3_registry_suite(output='/home/user/all_models_glassbeams_v3',
                           cache_dir='/home/user/cache/glassbeams_v3',
                           budget=600, train_cap=12000, seed=20261021):
     """Run every registered v3 arm; R37/R42 are regression-only by design."""
+    _require_ebm_dependency()
     models = ['r37', 'r42'] + list(RETAINED_DIRECT) + ['ebm-0', 'ebm-10']
     panels = [('california', range(5)), ('anneal', range(3)), ('binary', range(3))]
     outputs = {}
